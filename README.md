@@ -1,41 +1,45 @@
 <p align="center">
   <img src="https://img.shields.io/badge/go-1.25-00ADD8?style=flat-square&logo=go" alt="Go 1.25" />
   <img src="https://img.shields.io/badge/react-19-61DAFB?style=flat-square&logo=react" alt="React 19" />
-  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License" />
+  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/badge/postgres-optional-blue?style=flat-square&logo=postgresql" alt="PostgreSQL optional" />
 </p>
 
 <h1 align="center">📷 Seym's Gallery</h1>
 
 <p align="center">
-  <em>A self-hosted photo gallery with zero infrastructure. Point it at a folder, and it just works.</em>
+  <em>A self-hosted photo gallery. Point it at a folder, and it just works.</em>
+</p>
+
+<p align="center">
+  <a href="./README.zh-CN.md">🇨🇳 中文版</a>
 </p>
 
 ---
 
 ## ✨ Features
 
-- **🖥️ Zero config** — point `imageRoot` at a directory of photos, start browsing instantly
-- **📂 File-system aware** — directories become albums, nested folders preserve hierarchy
-- **🖼️ Smart previews** — auto-generates thumbnails, extracts embedded JPEG from RAW files
-- **📸 EXIF parsing** — camera, lens, aperture, ISO, focal length, shutter count, and star ratings
+- **🖥️ Zero config** — set `imageRoot` and start browsing instantly
+- **📂 File-system aware** — directories become albums, nested hierarchy preserved
+- **🖼️ Smart previews** — auto thumbnails, embedded JPEG extraction from RAW files
+- **📸 EXIF parsing** — camera, lens, aperture, ISO, focal length, shutter count, star ratings
 - **🎨 Retro skeuomorphic UI** — warm gray tones, tactile cards, dark/light mode, mobile responsive
 - **📱 WeChat Moments timeline** — browse albums as a social feed with inline Markdown readmes
 - **🔒 Album passwords** — drop an `ALBUM.yaml` with a password, no login system needed
 - **👍 Anonymous stats** — device fingerprinting tracks views/likes without cookies or accounts
-- **🌍 i18n** — 中文 / English, auto-detected from browser
+- **🌍 i18n** — English / 中文, auto-detected from browser
 - **⚡ Performant** — LRU thumbnail cache, ETag-based HTTP caching, lazy loading
 
 ## 🚀 Quick Start
 
 ```bash
-# 1. Generate sample gallery for testing
+# Generate sample gallery for testing
 make sample-gallery
 
-# 2. Install dependencies
+# Install dependencies
 make setup
 
-# 3. Start both frontend & backend
+# Start both frontend & backend
 make dev
 ```
 
@@ -80,7 +84,7 @@ cd frontend && VITE_API_BASE=http://127.0.0.1:8080 npm run dev
 
 ## ⚙️ Configuration
 
-Create a config file from the example:
+Copy from example:
 
 ```bash
 cp config.example.yaml config.yaml
@@ -123,7 +127,7 @@ readme: |
 ```
 
 - `readme` in YAML takes priority over `README.md`
-- Passwords are verified server-side, token stored in `sessionStorage`
+- Passwords verified server-side, token stored in `sessionStorage`
 
 ## 📡 API
 
@@ -155,7 +159,7 @@ Response format:
 
 ## 🔒 Privacy
 
-- **No accounts** — device fingerprinting via [FingerprintJS](https://github.com/fingerprintjs/fingerprintjs) for anonymous dedup
+- **No accounts** — device fingerprinting via [FingerprintJS](https://github.com/fingerprintjs/fingerprintjs)
 - **No cookies** — consent and preferences stored in `localStorage`
 - **No tracking** — stats are counts only, never tied to identity
 - **EU compliant** — cookie consent banner on first visit
@@ -178,5 +182,5 @@ MIT © 2026 [zsh2401](https://github.com/zsh2401)
 ---
 
 <p align="center">
-  <sub>Built with ❤️ for photographers who want to own their work.</sub>
+  <sub>Built for photographers who want to own their work.</sub>
 </p>
