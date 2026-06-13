@@ -10,6 +10,8 @@ frontend/dist/
 
 *.log
 *.db
+*.db-shm
+*.db-wal
 
 # Config files (may contain secrets)
 config.yaml

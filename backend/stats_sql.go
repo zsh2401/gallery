@@ -44,6 +44,19 @@ func newSQLStatsStore(driver, dsn string) (*sqlStatsStore, error) {
 }
 
 func (s *sqlStatsStore) migrate(ctx context.Context) error {
+	// SQLite optimizations for concurrent access
+	if s.driver == "sqlite" {
+		for _, pragma := range []string{
+			"PRAGMA journal_mode=WAL",
+			"PRAGMA busy_timeout=5000",
+			"PRAGMA synchronous=NORMAL",
+		} {
+			if _, err := s.db.ExecContext(ctx, pragma); err != nil {
+				return fmt.Errorf("migrate pragma: %w", err)
+			}
+		}
+	}
+
 	// All three tables use the same schema across SQLite / pg / mysql
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS item_stats (
@@ -126,6 +139,50 @@ func (s *sqlStatsStore) placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
 }
 
+// retryOnBusy retries a function on SQLite "database is locked" errors.
+// SQLite serializes writers; we retry up to maxAttempts with backoff.
+func (s *sqlStatsStore) retryOnBusy(fn func() error) error {
+	const maxAttempts = 10
+	const backoff = 10 * time.Millisecond
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		if s.driver != "sqlite" {
+			return err
+		}
+		// Only retry on lock errors
+		if !isSQLiteBusy(err) {
+			return err
+		}
+		time.Sleep(backoff * time.Duration(attempt+1))
+	}
+	return err
+}
+
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return containsStr(msg, "database is locked") || containsStr(msg, "SQLITE_BUSY")
+}
+
+func containsStr(s, substr string) bool {
+	return len(s) >= len(substr) && indexSubstr(s, substr) >= 0
+}
+
+func indexSubstr(s, substr string) int {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
+}
+
 // ── StatsStore implementation ──
 
 func (s *sqlStatsStore) Snapshot(targetType, targetID string) itemStats {
@@ -144,41 +201,47 @@ func (s *sqlStatsStore) Snapshot(targetType, targetID string) itemStats {
 }
 
 func (s *sqlStatsStore) IncrementView(targetType, targetID, deviceID string) itemStats {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+	var result itemStats
+	s.retryOnBusy(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return itemStats{}
-	}
-	defer tx.Rollback()
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
 
-	// Try to record this device view; no-op if already seen
-	insertSQL := s.insertIgnoreSQL("device_views", "device_id, target_type, target_id", "device_id, target_type, target_id")
-	insertSQL += " VALUES (" + s.placeholders(3) + ")"
-	result, err := tx.ExecContext(ctx, insertSQL, deviceID, targetType, targetID)
-	if err != nil {
-		return s.readStats(ctx, tx, targetType, targetID)
-	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return s.readStats(ctx, tx, targetType, targetID)
-	}
+		// Try to record this device view; no-op if already seen
+		insertSQL := s.insertIgnoreSQL("device_views", "device_id, target_type, target_id", "device_id, target_type, target_id")
+		insertSQL += " VALUES (" + s.placeholders(3) + ")"
+		res, err := tx.ExecContext(ctx, insertSQL, deviceID, targetType, targetID)
+		if err != nil {
+			result = s.readStats(ctx, tx, targetType, targetID)
+			return nil // duplicate is not a retryable error
+		}
+		rows, _ := res.RowsAffected()
+		if rows == 0 {
+			result = s.readStats(ctx, tx, targetType, targetID)
+			return nil
+		}
 
-	// First view — upsert with views = 1 or increment
-	upsertSQL := s.upsertCounterSQL("item_stats",
-		"target_type, target_id, views, likes, dislikes",
-		"target_type, target_id",
-		"views = item_stats.views + 1")
-	_, err = tx.ExecContext(ctx, upsertSQL, targetType, targetID, 1, 0, 0)
-	if err != nil {
-		return itemStats{}
-	}
+		// First view — upsert with views = 1 or increment
+		upsertSQL := s.upsertCounterSQL("item_stats",
+			"target_type, target_id, views, likes, dislikes",
+			"target_type, target_id",
+			"views = item_stats.views + 1")
+		if _, err := tx.ExecContext(ctx, upsertSQL, targetType, targetID, 1, 0, 0); err != nil {
+			return err
+		}
 
-	if err := tx.Commit(); err != nil {
-		return itemStats{}
-	}
-	return s.Snapshot(targetType, targetID)
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		result = s.Snapshot(targetType, targetID)
+		return nil
+	})
+	return result
 }
 
 func (s *sqlStatsStore) IncrementReaction(targetType, targetID, deviceID, reaction string, active bool) (itemStats, error) {
@@ -186,63 +249,71 @@ func (s *sqlStatsStore) IncrementReaction(targetType, targetID, deviceID, reacti
 		return itemStats{}, fmt.Errorf("%w: unsupported reaction", errBadRequest)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+	var result itemStats
+	var resultErr error
+	s.retryOnBusy(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return itemStats{}, err
-	}
-	defer tx.Rollback()
-
-	// Read current device reaction
-	var existingReaction sql.NullString
-	_ = tx.QueryRowContext(ctx,
-		`SELECT reaction FROM device_reactions WHERE device_id=? AND target_type=? AND target_id=?`,
-		deviceID, targetType, targetID,
-	).Scan(&existingReaction)
-
-	existing := ""
-	if existingReaction.Valid {
-		existing = existingReaction.String
-	}
-
-	if active {
-		if existing == reaction {
-			return s.readStats(ctx, tx, targetType, targetID), nil
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
 		}
-		// Decrement old reaction
-		if existing == "like" || existing == "dislike" {
-			s.decrementReaction(ctx, tx, targetType, targetID, existing)
-		}
-		// Upsert device reaction
-		upsertSQL := s.upsertSetSQL("device_reactions",
-			"device_id, target_type, target_id, reaction",
-			"device_id, target_type, target_id",
-			"reaction="+s.valueRef("reaction"))
-		_, _ = tx.ExecContext(ctx, upsertSQL, deviceID, targetType, targetID, reaction)
-		// Increment new reaction
-		upsertStatsSQL := s.upsertCounterSQL("item_stats",
-			"target_type, target_id, views, likes, dislikes",
-			"target_type, target_id",
-			s.reactionCol(reaction)+" = item_stats."+s.reactionCol(reaction)+" + 1")
-		_, _ = tx.ExecContext(ctx, upsertStatsSQL, targetType, targetID, 0, boolInt2(reaction == "like"), boolInt2(reaction == "dislike"))
-	} else {
-		if existing != reaction {
-			return s.readStats(ctx, tx, targetType, targetID), nil
-		}
-		// Delete device reaction
-		_, _ = tx.ExecContext(ctx,
-			`DELETE FROM device_reactions WHERE device_id=? AND target_type=? AND target_id=?`,
-			deviceID, targetType, targetID)
-		// Decrement reaction count
-		s.decrementReaction(ctx, tx, targetType, targetID, reaction)
-	}
+		defer tx.Rollback()
 
-	if err := tx.Commit(); err != nil {
-		return itemStats{}, err
-	}
-	return s.Snapshot(targetType, targetID), nil
+		// Read current device reaction
+		var existingReaction sql.NullString
+		_ = tx.QueryRowContext(ctx,
+			`SELECT reaction FROM device_reactions WHERE device_id=? AND target_type=? AND target_id=?`,
+			deviceID, targetType, targetID,
+		).Scan(&existingReaction)
+
+		existing := ""
+		if existingReaction.Valid {
+			existing = existingReaction.String
+		}
+
+		if active {
+			if existing == reaction {
+				result = s.readStats(ctx, tx, targetType, targetID)
+				return nil
+			}
+			// Decrement old reaction
+			if existing == "like" || existing == "dislike" {
+				s.decrementReaction(ctx, tx, targetType, targetID, existing)
+			}
+			// Upsert device reaction
+			upsertSQL := s.upsertSetSQL("device_reactions",
+				"device_id, target_type, target_id, reaction",
+				"device_id, target_type, target_id",
+				"reaction="+s.valueRef("reaction"))
+			_, _ = tx.ExecContext(ctx, upsertSQL, deviceID, targetType, targetID, reaction)
+			// Increment new reaction
+			upsertStatsSQL := s.upsertCounterSQL("item_stats",
+				"target_type, target_id, views, likes, dislikes",
+				"target_type, target_id",
+				s.reactionCol(reaction)+" = item_stats."+s.reactionCol(reaction)+" + 1")
+			_, _ = tx.ExecContext(ctx, upsertStatsSQL, targetType, targetID, 0, boolInt2(reaction == "like"), boolInt2(reaction == "dislike"))
+		} else {
+			if existing != reaction {
+				result = s.readStats(ctx, tx, targetType, targetID)
+				return nil
+			}
+			// Delete device reaction
+			_, _ = tx.ExecContext(ctx,
+				`DELETE FROM device_reactions WHERE device_id=? AND target_type=? AND target_id=?`,
+				deviceID, targetType, targetID)
+			// Decrement reaction count
+			s.decrementReaction(ctx, tx, targetType, targetID, reaction)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		result = s.Snapshot(targetType, targetID)
+		return nil
+	})
+	return result, resultErr
 }
 
 func (s *sqlStatsStore) readStats(ctx context.Context, tx *sql.Tx, targetType, targetID string) itemStats {
