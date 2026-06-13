@@ -286,3 +286,63 @@ func mustTest(t *testing.T, err error) {
 		t.Fatal(err)
 	}
 }
+
+func TestSQLiteStatsStore(t *testing.T) {
+	dir := t.TempDir()
+	store, err := newSQLStatsStore("sqlite", filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Views
+	first := store.IncrementView("album", "a", "dev1")
+	if first.Views != 1 || first.Likes != 0 || first.Dislikes != 0 {
+		t.Fatalf("first view: %#v", first)
+	}
+	second := store.IncrementView("album", "a", "dev1")
+	if second.Views != 1 {
+		t.Fatalf("duplicate view: %#v", second)
+	}
+	third := store.IncrementView("album", "a", "dev2")
+	if third.Views != 2 {
+		t.Fatalf("different device: %#v", third)
+	}
+
+	// Reactions
+	liked, err := store.IncrementReaction("album", "a", "dev1", "like", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if liked.Likes != 1 {
+		t.Fatalf("like: %#v", liked)
+	}
+
+	// Switch to dislike
+	disliked, err := store.IncrementReaction("album", "a", "dev1", "dislike", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disliked.Likes != 0 || disliked.Dislikes != 1 {
+		t.Fatalf("switch reaction: %#v", disliked)
+	}
+
+	// Remove reaction
+	removed, err := store.IncrementReaction("album", "a", "dev1", "dislike", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed.Dislikes != 0 {
+		t.Fatalf("remove reaction: %#v", removed)
+	}
+
+	// Bad reaction
+	if _, err := store.IncrementReaction("album", "a", "dev1", "wow", true); err == nil {
+		t.Fatal("expected unsupported reaction to fail")
+	}
+
+	// Snapshot
+	snap := store.Snapshot("album", "a")
+	if snap.Views != 2 || snap.Likes != 0 || snap.Dislikes != 0 {
+		t.Fatalf("snapshot: %#v", snap)
+	}
+}

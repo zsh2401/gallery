@@ -21,8 +21,15 @@ cors:
     - http://localhost:5173
     - http://127.0.0.1:5173
 
-# Stats storage backend. "memory" (default, no config needed) or "postgres".
+# Stats storage backend. "sqlite" (default), "memory", "postgres", or "mysql".
+# sqlite needs no extra config — just works with a local file.
 stats:
-  backend: memory
+  backend: sqlite
+  # sqlite:
+  #   path: "gallery.db"
+  #
   # postgres:
   #   dsn: "postgres://user:pass@localhost:5432/gallery?sslmode=disable"
+  #
+  # mysql:
+  #   dsn: "user:pass@tcp(localhost:3306)/gallery?parseTime=true"

@@ -32,8 +32,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rwcarlsen/goexif/exif"
 	"github.com/rwcarlsen/goexif/tiff"
 	"golang.org/x/image/draw"
@@ -93,10 +91,16 @@ type Config struct {
 		AllowedOrigins []string `yaml:"allowedOrigins"`
 	} `yaml:"cors"`
 	Stats struct {
-		Backend  string `yaml:"backend"`
+		Backend  string `yaml:"backend"` // "sqlite" (default), "postgres", "mysql", "memory"
+		SQLite   struct {
+			Path string `yaml:"path"` // defaults to "gallery.db"
+		} `yaml:"sqlite"`
 		Postgres struct {
 			DSN string `yaml:"dsn"`
 		} `yaml:"postgres"`
+		MySQL struct {
+			DSN string `yaml:"dsn"`
+		} `yaml:"mysql"`
 	} `yaml:"stats"`
 }
 
@@ -2246,10 +2250,27 @@ type StatsStore interface {
 }
 
 func newStatsStore(cfg Config) (StatsStore, error) {
-	if cfg.Stats.Backend == "postgres" && cfg.Stats.Postgres.DSN != "" {
-		return newPgStatsStore(cfg.Stats.Postgres.DSN)
+	switch cfg.Stats.Backend {
+	case "postgres":
+		if cfg.Stats.Postgres.DSN == "" {
+			return nil, errors.New("stats.postgres.dsn is required")
+		}
+		return newSQLStatsStore("pgx", cfg.Stats.Postgres.DSN)
+	case "mysql":
+		if cfg.Stats.MySQL.DSN == "" {
+			return nil, errors.New("stats.mysql.dsn is required")
+		}
+		return newSQLStatsStore("mysql", cfg.Stats.MySQL.DSN)
+	case "memory":
+		return newMemoryStatsStore(), nil
+	default:
+		// sqlite is the default
+		path := cfg.Stats.SQLite.Path
+		if path == "" {
+			path = "gallery.db"
+		}
+		return newSQLStatsStore("sqlite", path)
 	}
-	return newMemoryStatsStore(), nil
 }
 
 func mustNewStatsStore(cfg Config) StatsStore {
@@ -2360,209 +2381,7 @@ func (s *memoryStatsStore) IncrementReaction(targetType, targetID, deviceID, rea
 	return stats, nil
 }
 
-// ── PostgreSQL stats store ──
 
-type pgStatsStore struct {
-	pool *pgxpool.Pool
-}
-
-func newPgStatsStore(dsn string) (*pgStatsStore, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("pg stats: connect: %w", err)
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("pg stats: ping: %w", err)
-	}
-
-	store := &pgStatsStore{pool: pool}
-	if err := store.migrate(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("pg stats: migrate: %w", err)
-	}
-	return store, nil
-}
-
-func (s *pgStatsStore) migrate(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS item_stats (
-			target_type TEXT NOT NULL,
-			target_id   TEXT NOT NULL,
-			views       BIGINT NOT NULL DEFAULT 0,
-			likes       BIGINT NOT NULL DEFAULT 0,
-			dislikes    BIGINT NOT NULL DEFAULT 0,
-			PRIMARY KEY (target_type, target_id)
-		);
-
-		CREATE TABLE IF NOT EXISTS device_views (
-			device_id   TEXT NOT NULL,
-			target_type TEXT NOT NULL,
-			target_id   TEXT NOT NULL,
-			PRIMARY KEY (device_id, target_type, target_id)
-		);
-
-		CREATE TABLE IF NOT EXISTS device_reactions (
-			device_id   TEXT NOT NULL,
-			target_type TEXT NOT NULL,
-			target_id   TEXT NOT NULL,
-			reaction    TEXT NOT NULL,
-			PRIMARY KEY (device_id, target_type, target_id)
-		);
-	`)
-	return err
-}
-
-func (s *pgStatsStore) Snapshot(targetType, targetID string) itemStats {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	var stats itemStats
-	err := s.pool.QueryRow(ctx,
-		`SELECT views, likes, dislikes FROM item_stats WHERE target_type=$1 AND target_id=$2`,
-		targetType, targetID,
-	).Scan(&stats.Views, &stats.Likes, &stats.Dislikes)
-	if err != nil {
-		return itemStats{} // not found → zeros
-	}
-	return stats
-}
-
-func (s *pgStatsStore) IncrementView(targetType, targetID, deviceID string) itemStats {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return itemStats{}
-	}
-	defer tx.Rollback(ctx)
-
-	// Insert ignore into device_views; if already exists, return current stats
-	var existed bool
-	err = tx.QueryRow(ctx,
-		`INSERT INTO device_views (device_id, target_type, target_id) VALUES ($1,$2,$3)
-		 ON CONFLICT DO NOTHING RETURNING TRUE`,
-		deviceID, targetType, targetID,
-	).Scan(&existed)
-	inserted := err == nil
-
-	if !inserted {
-		// Already viewed — just return current counts
-		var stats itemStats
-		err = tx.QueryRow(ctx,
-			`SELECT views, likes, dislikes FROM item_stats WHERE target_type=$1 AND target_id=$2`,
-			targetType, targetID,
-		).Scan(&stats.Views, &stats.Likes, &stats.Dislikes)
-		if err != nil {
-			return itemStats{}
-		}
-		return stats
-	}
-
-	// First view from this device — upsert +1
-	var stats itemStats
-	err = tx.QueryRow(ctx, `
-		INSERT INTO item_stats (target_type, target_id, views, likes, dislikes)
-		VALUES ($1, $2, 1, 0, 0)
-		ON CONFLICT (target_type, target_id)
-		DO UPDATE SET views = item_stats.views + 1
-		RETURNING views, likes, dislikes
-	`, targetType, targetID).Scan(&stats.Views, &stats.Likes, &stats.Dislikes)
-	if err != nil {
-		return itemStats{}
-	}
-
-	_ = tx.Commit(ctx)
-	return stats
-}
-
-func (s *pgStatsStore) IncrementReaction(targetType, targetID, deviceID, reaction string, active bool) (itemStats, error) {
-	if reaction != "like" && reaction != "dislike" {
-		return itemStats{}, fmt.Errorf("%w: unsupported reaction", errBadRequest)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return itemStats{}, err
-	}
-	defer tx.Rollback(ctx)
-
-	// Read current device reaction and item stats
-	var existingReaction string
-	_ = tx.QueryRow(ctx,
-		`SELECT reaction FROM device_reactions WHERE device_id=$1 AND target_type=$2 AND target_id=$3`,
-		deviceID, targetType, targetID,
-	).Scan(&existingReaction)
-
-	if active {
-		if existingReaction == reaction {
-			// No change
-			return s.readStatsTx(ctx, tx, targetType, targetID)
-		}
-		// Decrement old reaction
-		if existingReaction == "like" || existingReaction == "dislike" {
-			_, _ = tx.Exec(ctx,
-				fmt.Sprintf(`UPDATE item_stats SET %ss = GREATEST(%ss - 1, 0) WHERE target_type=$1 AND target_id=$2`,
-					existingReaction, existingReaction),
-				targetType, targetID)
-		}
-		// Upsert device reaction
-		_, _ = tx.Exec(ctx,
-			`INSERT INTO device_reactions (device_id, target_type, target_id, reaction) VALUES ($1,$2,$3,$4)
-			 ON CONFLICT (device_id, target_type, target_id) DO UPDATE SET reaction=$4`,
-			deviceID, targetType, targetID, reaction)
-		// Increment new reaction
-		_, _ = tx.Exec(ctx,
-			fmt.Sprintf(`INSERT INTO item_stats (target_type, target_id, views, likes, dislikes)
-			 VALUES ($1, $2, 0, %d, %d)
-			 ON CONFLICT (target_type, target_id) DO UPDATE SET %ss = item_stats.%ss + 1`,
-				boolInt(reaction == "like"), boolInt(reaction == "dislike"), reaction, reaction),
-			targetType, targetID)
-	} else {
-		// Remove reaction
-		if existingReaction != reaction {
-			return s.readStatsTx(ctx, tx, targetType, targetID)
-		}
-		_, _ = tx.Exec(ctx,
-			`DELETE FROM device_reactions WHERE device_id=$1 AND target_type=$2 AND target_id=$3`,
-			deviceID, targetType, targetID)
-		_, _ = tx.Exec(ctx,
-			fmt.Sprintf(`UPDATE item_stats SET %ss = GREATEST(%ss - 1, 0) WHERE target_type=$1 AND target_id=$2`,
-				reaction, reaction),
-			targetType, targetID)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return itemStats{}, err
-	}
-	return s.Snapshot(targetType, targetID), nil
-}
-
-func (s *pgStatsStore) readStatsTx(ctx context.Context, tx pgx.Tx, targetType, targetID string) (itemStats, error) {
-	var stats itemStats
-	err := tx.QueryRow(ctx,
-		`SELECT views, likes, dislikes FROM item_stats WHERE target_type=$1 AND target_id=$2`,
-		targetType, targetID,
-	).Scan(&stats.Views, &stats.Likes, &stats.Dislikes)
-	if err != nil {
-		return itemStats{}, nil
-	}
-	return stats, nil
-}
-
-func boolInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
-}
 
 func statsKey(targetType, targetID string) string {
 	return targetType + ":" + targetID
