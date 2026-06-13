@@ -1,0 +1,16 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+cmd = "go build -o ./tmp/seymours-gallery ./"
+entrypoint = ["./tmp/seymours-gallery", "--config", "../config.example.yaml"]
+delay = 300
+exclude_dir = ["tmp", "vendor", "bin"]
+include_ext = ["go", "yaml", "yml"]
+stop_on_error = true
+
+[log]
+time = true
+
+[misc]
+clean_on_exit = true

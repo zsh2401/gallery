@@ -1,0 +1,28 @@
+imageRoot: ./.sample-gallery
+
+server:
+  bind: 127.0.0.1:8080
+
+cache:
+  backend: memory
+  ttl: 24h
+  thumbnailMaxBytes: 536870912
+
+logging:
+  level: debug
+  format: pretty
+
+features:
+  rawPreview: embedded-jpeg
+  mapProvider: amap
+
+cors:
+  allowedOrigins:
+    - http://localhost:5173
+    - http://127.0.0.1:5173
+
+# Stats storage backend. "memory" (default, no config needed) or "postgres".
+stats:
+  backend: memory
+  # postgres:
+  #   dsn: "postgres://user:pass@localhost:5432/gallery?sslmode=disable"
